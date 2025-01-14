@@ -1,0 +1,990 @@
+import requests
+import pandas as pd
+import tkinter as tk
+from tkinter import messagebox
+import threading
+from pandas import json_normalize
+from unidecode import unidecode
+from difflib import SequenceMatcher
+
+
+class PyCartola(tk.Tk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Cartola App")
+        self.geometry("50x70")
+
+        # Criar botão para obter mercado iniciando por uma thread
+        self.button_obter_mercado = tk.Button(self, text="Obter Mercado", command=self.iniciar)
+        self.button_obter_mercado.pack()
+
+        url_mercado = "https://api.cartola.globo.com/atletas/mercado"
+
+        # - VARIÁVEIS DE CONTAGEM
+        self.n_goleiro = 1
+        self.n_zagueiros = 2
+        self.n_laterais = 2
+        self.n_meias = 3
+        self.n_atacantes = 3
+        self.n_treinador = 1
+
+        # - VARIÁVEIS DE CALCULO
+        self.fator_desarme_fora = 1.2
+
+        self.df_mercado = pd.DataFrame()
+        self.df_rodadas = pd.DataFrame()
+        self.df_pontuados = pd.DataFrame()
+        self.df_cedidos_completo = pd.DataFrame()
+
+        self.posicoes = {
+            "1": {"id": 1, "nome": "Goleiro", "abreviacao": "gol"},
+            "2": {"id": 2, "nome": "Lateral", "abreviacao": "lat"},
+            "3": {"id": 3, "nome": "Zagueiro", "abreviacao": "zag"},
+            "4": {"id": 4, "nome": "Meia", "abreviacao": "mei"},
+            "5": {"id": 5, "nome": "Atacante", "abreviacao": "ata"},
+            "6": {"id": 6, "nome": "Técnico", "abreviacao": "tec"}
+        }
+        # Cria um dicionário para armazenar os scouts
+        self.scouts = {'DS': 'Desarme',
+                  'FC': 'Falta cometida',
+                  'FF': 'Finalização para Fora',
+                  'FD': 'Finalização Defendida',
+                  'FS': 'Falta Sofrida',
+                  'A': 'Assistencia',
+                  'CA': 'Cartão Amarelo',
+                  'I': 'Impedimento',
+                  'SG': 'Saldo de Gol',
+                  'G': 'Gol',
+                  'DE': 'Defesa',
+                  'GS': 'Gol Sofrido',
+                  'V': 'Vitoria',
+                  'CV': 'Cartão Vermelho',
+                  'FT': 'Finalização na Trave',
+                  'PC': 'Penalti Cometido',
+                  'PS': 'Penalti Sofrido',
+                  'PP': 'Penalti Perdido'}
+
+    def iniciar(self):
+        thread = threading.Thread(target=self.obter_mercado)
+        thread.start()
+
+    def obter_mercado(self):
+        # Obter os dados do mercado da API ======================================================== MERCADO
+        url = "https://api.cartola.globo.com/atletas/mercado"
+        response = requests.get(url)
+        mercado_folder = r"C:\Users\renan\OneDrive\Documentos\API_CARTOLA\pontuados"
+        # print(f'Status code: {response.status_code}')
+        if response.status_code == 200:
+            data_jogadores = response.json()['atletas']  # Acessando a lista de jogadores
+
+            # Obter a rodada_id a partir do primeiro jogador da lista e adicionar +1 para pegar a proxima rodada
+            rodada_id = data_jogadores[0]['rodada_id'] + 1
+
+
+            # Criar uma lista de dicionários para cada jogador
+            jogadores_list = []
+            for jogador in data_jogadores:
+                jogadores_list.append({
+                    'atleta_id': jogador['atleta_id'],
+                    'nome': jogador['nome'],
+                    'apelido': jogador['apelido'],
+                    'clube_id': jogador['clube_id'],
+                    'status_id': jogador['status_id'],
+                    'preco_num': jogador['preco_num'],
+                    'variacao_num': jogador['variacao_num'],
+                    'media_num': jogador['media_num'],
+                    'jogos_num': jogador['jogos_num'],
+                    'rodada_id': rodada_id
+                })
+            self.df_mercado = pd.DataFrame(jogadores_list)
+            # print('df_mercado:')
+            # print(self.df_mercado)
+
+        self.adicionar_adversario_id_e_mando()
+
+    def adicionar_adversario_id_e_mando(self):
+        def rodada_atual():
+            response = requests.get("https://api.cartolafc.globo.com/mercado/status")
+            # Verifica se a solicitação foi bem-sucedida
+            if response.status_code == 200:
+                # Extrai os dados JSON da resposta
+                data = response.json()
+                rodada_atual = data["rodada_atual"]
+                return rodada_atual
+        # Criar coluna chamada adversario_id que buscará o atleta_id do jogador na planilha rodadas.xlsx
+        self.df_rodadas = pd.DataFrame(columns=["rodada_id", "clube_id", "clube_visitante_id"])  # Cria um DataFrame vazio
+        for rodada in range(1, (rodada_atual() + 1)):
+            print(f"Rodada {rodada}: Carregado!")
+            url = f"https://api.cartola.globo.com/partidas/{rodada}"
+            response = requests.get(url)
+
+            if response.status_code == 200:
+                data = response.json()
+                partidas = data["partidas"]
+
+                # Itera sobre as partidas da rodada atual
+                for partida in partidas:
+                    clube_mandante = partida["clube_casa_id"]
+                    clube_visitante = partida["clube_visitante_id"]
+                    self.df_rodadas = self.df_rodadas._append(
+                        {"rodada_id": rodada, "clube_id": clube_mandante, "clube_visitante_id": clube_visitante},
+                        ignore_index=True)
+            else:
+                messagebox.showerror("Erro",
+                                     f"Falha ao acessar a API da rodada {rodada}. Código de status: {response.status_code}")
+
+        # Adiciona uma coluna vazia na planilha_associada chamada adversario_id e uma de mando
+        self.df_mercado['adversario_id'] = ''
+        self.df_mercado['mando'] = ''
+
+        def procurar_adversario(row):
+            print(f"\rProcurando adversário para {row['nome']} na rodada {row['rodada_id']}...", end='')
+            # Se o 'clube_id' for diferente de vazio, então o mando é CASA
+            adversario_id = \
+            self.df_rodadas[(self.df_rodadas['rodada_id'] == row['rodada_id']) & (self.df_rodadas['clube_id'] == row['clube_id'])][
+                'clube_visitante_id'].values
+            if len(adversario_id) > 0:
+                self.df_mercado.at[row.name, 'mando'] = 'CASA'
+                return adversario_id[0]
+            else:
+                adversario_id = self.df_rodadas[(self.df_rodadas['rodada_id'] == row['rodada_id']) & (
+                            self.df_rodadas['clube_visitante_id'] == row['clube_id'])]['clube_id'].values
+                if len(adversario_id) > 0:
+                    self.df_mercado.at[row.name, 'mando'] = 'FORA'
+                    return adversario_id[0]
+                else:
+                    return None  # Se não encontrou adversário, retorna None
+
+        # Adicionar valores à coluna adversario_id
+        self.df_mercado['adversario_id'] = self.df_mercado.apply(procurar_adversario, axis=1)
+        print('')
+        # print(f'Adversários encontrados: {self.df_mercado["adversario_id"].notna().sum()}')
+
+        # Colocar a coluna 'adversario_id' depois da coluna 'clube_id'
+        posicao_id_index = self.df_mercado.columns.get_loc('clube_id')
+        self.df_mercado.insert(posicao_id_index + 1, 'adversario_id', self.df_mercado.pop('adversario_id'))
+        # print(f'Adversários colocados: {self.df_mercado["adversario_id"].notna().sum()}')
+
+        # Colocar a coluna 'mando' depois da coluna 'rodada_id'
+        mando_index = self.df_mercado.columns.get_loc('rodada_id')
+        self.df_mercado.insert(mando_index + 1, 'mando', self.df_mercado.pop('mando'))
+        # print(f'Mandos colocados: {self.df_mercado["mando"].notna().sum()}')
+
+        # print(self.df_mercado)
+        self.df_mercado.to_excel(r'C:\Users\renan\OneDrive\Documentos\PyCartola_BETA\mercado.xlsx', index=False)
+
+        self.adicionar_coluna_posicao_jogador()
+
+    def adicionar_coluna_posicao_jogador(self):
+        def rodada_atual():
+            response = requests.get("https://api.cartolafc.globo.com/mercado/status")
+            # Verifica se a solicitação foi bem-sucedida
+            if response.status_code == 200:
+                # Extrai os dados JSON da resposta
+                data = response.json()
+                rodada_atual = data["rodada_atual"]
+                return rodada_atual
+        # Função para obter os dados de uma rodada específica da API do Cartola
+        def obter_dados_rodada(rodada):
+            url = f"https://api.cartola.globo.com/atletas/pontuados/{rodada}"
+            response = requests.get(url)
+            if response.status_code == 200:
+                data = response.json()
+                if 'atletas' in data:
+                    return data
+                else:
+                    return None
+            else:
+                if rodada == 1:
+                    print(f"Falha ao obter dados da rodada {rodada}. Status code: {response.status_code}")
+                return None
+        # Função para criar o DataFrame com os dados de todas as rodadas
+        def criar_dataframe():
+            # Inicializando listas para armazenar os dados de todas as rodadas
+            dados_rodadas = []
+            atletas_ids = []
+
+            # Iterando sobre as rodadas de 1 a 38
+            for rodada in range(1, 39):
+                dados_rodada = obter_dados_rodada(rodada)
+                if dados_rodada:
+                    # Adicionando os dados da rodada à lista
+                    dados_rodadas.append(dados_rodada)
+                    # Adicionando os IDs dos jogadores à lista
+                    atletas_ids.extend(dados_rodada['atletas'].keys())
+                else:
+                    break  # Encerra o loop se ocorrer um erro na primeira iteração
+
+            if dados_rodadas:
+                # Concatenando os dados de todas as rodadas em um único DataFrame
+                df = pd.concat([pd.DataFrame(rodada['atletas'].values()) for rodada in dados_rodadas])
+
+                # Adicionando a coluna "rodada" com o número da rodada correspondente
+                df['rodada'] = [dados_rodada['rodada'] for dados_rodada in dados_rodadas for _ in
+                                range(len(dados_rodada['atletas']))]
+
+                # Adicionando a coluna "atleta_id"
+                df['atleta_id'] = atletas_ids
+
+                # Explorando a coluna 'scout' em colunas individuais
+                df_scout = json_normalize(df['scout'])
+                # Resetando os índices para evitar duplicatas
+                df.reset_index(drop=True, inplace=True)
+                df_scout.reset_index(drop=True, inplace=True)
+                # Concatenando as colunas de scout com o DataFrame original
+                df = pd.concat([df, df_scout], axis=1)
+                # Removendo a coluna 'scout' original
+                df = df.drop(columns=['scout'])
+
+                # Reorganizando as colunas na ordem desejada
+                df = df[['atleta_id', 'apelido', 'foto', 'posicao_id', 'clube_id', 'entrou_em_campo', 'pontuacao',
+                         'rodada'] + df_scout.columns.tolist()]
+
+                # Renomeando a coluna rodada para rodada_id
+                df = df.rename(columns={'rodada': 'rodada_id'})
+                return df
+            else:
+                return None
+        # Criando o DataFrame com os dados de todas as rodadas
+        df_pontuados = criar_dataframe()
+
+        # Adicionando a coluna nome_completo à planilha
+        # Faz a solicitação GET para a API
+        response = requests.get("https://api.cartola.globo.com/atletas/mercado")
+
+        # Verifica se a solicitação foi bem-sucedida
+        if response.status_code == 200:
+            # Extrai os dados JSON da resposta
+            data = response.json()
+
+            # Inicializa listas para armazenar os atleta_id e nomes
+            atleta_ids = []
+            nomes = []
+
+            # Itera sobre os atletas no mercado e extrai os dados necessários
+            for atleta in data['atletas']:
+                atleta_ids.append(atleta['atleta_id'])
+                nomes.append(atleta['nome'])
+
+            # Cria um DataFrame com os dados extraídos
+            df_mercado = pd.DataFrame({'atleta_id': atleta_ids, 'nome': nomes})
+        else:
+            print("Falha ao obter os dados da API.")
+        df_pontuados['atleta_id'] = df_pontuados['atleta_id'].astype(int)
+        df_mercado['atleta_id'] = df_mercado['atleta_id'].astype(int)
+
+        # Merging df_pontuados with df based on 'atleta_id'
+        df_pontuados = df_pontuados.merge(df_mercado, on='atleta_id', how='left')
+
+        # Colocar a coluna 'nome' depois da coluna 'apelido'
+        apelido_index = df_pontuados.columns.get_loc('apelido')
+        df_pontuados.insert(apelido_index + 1, 'nome', df_pontuados.pop('nome'))
+
+        # Adicionar coluna posicao_jogador
+        # Carregar as planilhas
+        caminho_jogadores_posicao = r'C:\Users\renan\OneDrive\Documentos\API_CARTOLA\jogadores-posicoes\jogadores_posicao.xlsx'
+        jogadores_posicao = pd.read_excel(caminho_jogadores_posicao)
+
+        # Função para remover acentos
+        def remover_acentos(texto):
+            return unidecode(texto)
+
+        # Transformar a coluna 'nome' em string
+        df_pontuados['nome'] = df_pontuados['nome'].astype(str).apply(remover_acentos)
+
+        jogadores_posicao['Nome'] = jogadores_posicao['Nome'].apply(remover_acentos)
+
+        planilha_associada = pd.merge(df_pontuados, jogadores_posicao, how='left',
+                                      left_on=['clube_id', 'nome'], right_on=['clube_id', 'Nome'])
+
+
+        # Função para calcular a similaridade entre strings
+        def similar(a, b):
+            return SequenceMatcher(None, a, b).ratio()
+
+        # Preencher a coluna 'Posição' com base na similaridade dos nomes dos jogadores
+        def preencher_posicao(row):
+            if pd.isnull(row['Posição']):
+                jogadores_mesmo_clube = jogadores_posicao[jogadores_posicao['clube_id'] == row['clube_id']]
+                max_sim = -1
+                posicao = None
+                for index, jogador in jogadores_mesmo_clube.iterrows():
+                    sim = similar(row['nome'], jogador['Nome'])
+                    if sim > max_sim:
+                        max_sim = sim
+                        posicao = jogador['Posição']
+                if max_sim > 0.6:  # Define o limite de similaridade
+                    return posicao
+            return row['Posição']
+
+        planilha_associada['Posição'] = planilha_associada.apply(preencher_posicao, axis=1)
+
+        # Reorganizar as colunas para posicionar a coluna 'Posição' após a coluna 'posicao_id'
+        colunas = list(planilha_associada.columns)
+        planilha_associada = planilha_associada[colunas]
+        planilha_associada = planilha_associada.drop(columns=['Nome', 'Time'])
+        planilha_associada.rename(columns={'Posição': 'posicao_jogador'}, inplace=True)
+
+        # Iterate over the rows
+        for index, row in planilha_associada.iterrows():
+            posicao_id = str(row['posicao_id'])
+            if posicao_id in self.posicoes:
+                nome_posicao = self.posicoes[posicao_id]['nome']
+                # Check if 'posicao_jogador' is empty
+                if pd.isnull(row['posicao_jogador']):
+                    # Fill the empty 'posicao_jogador' with the corresponding 'nome' value
+                    planilha_associada.at[index, 'posicao_jogador'] = nome_posicao
+
+        # Colocar a coluna 'posicao_jogador' depois da coluna 'posicao_id'
+        posicao_id_index = planilha_associada.columns.get_loc('posicao_id')
+        planilha_associada.insert(posicao_id_index + 1, 'posicao_jogador', planilha_associada.pop('posicao_jogador'))
+
+        # Substituir 'VERDADEIRO' por 1 e 'FALSO' por 0 na coluna 'entrou_em_campo'
+        planilha_associada['entrou_em_campo'] = planilha_associada['entrou_em_campo'].astype(bool).map({True: 1, False: 0})
+
+
+        # Até aqui a planilha associada pode ser chamada de pontuados_completo
+        pontuados_completo = planilha_associada
+        pontuados_completo.to_excel(r'C:\Users\renan\OneDrive\Documentos\PyCartola_BETA\pontuados_completo.xlsx')
+
+        # ----------------------------- CRIANDO CEDIDOS
+        # Adiciona uma coluna vazia na planilha_associada chamada adversario_id e uma de mando
+        pontuados_completo['adversario_id'] = ''
+        pontuados_completo['mando'] = ''
+
+        def procurar_adversario(row):
+            print(f"\rProcurando adversário para {row['nome']} na rodada {row['rodada_id']}...", end='')
+            # Se o 'clube_id' for diferente de vazio, então o mando é CASA
+            adversario_id = \
+            self.df_rodadas[(self.df_rodadas['rodada_id'] == row['rodada_id']) & (self.df_rodadas['clube_id'] == row['clube_id'])][
+                'clube_visitante_id'].values
+            if len(adversario_id) > 0:
+                pontuados_completo.at[row.name, 'mando'] = 'CASA'
+                return adversario_id[0]
+            else:
+                adversario_id = self.df_rodadas[(self.df_rodadas['rodada_id'] == row['rodada_id']) & (
+                            self.df_rodadas['clube_visitante_id'] == row['clube_id'])]['clube_id'].values
+                if len(adversario_id) > 0:
+                    pontuados_completo.at[row.name, 'mando'] = 'FORA'
+                    return adversario_id[0]
+                else:
+                    return None  # Se não encontrou adversário, retorna None
+
+        # Adicionar valores à coluna adversario_id
+        pontuados_completo['adversario_id'] = pontuados_completo.apply(procurar_adversario, axis=1)
+        print('')
+        print(f'Adversários encontrados: {pontuados_completo["adversario_id"].notna().sum()}')
+
+        # Colocar a coluna 'adversario_id' depois da coluna 'clube_id'
+        posicao_id_index = pontuados_completo.columns.get_loc('clube_id')
+        pontuados_completo.insert(posicao_id_index + 1, 'adversario_id', pontuados_completo.pop('adversario_id'))
+        print(f'Adversários colocados: {pontuados_completo["adversario_id"].notna().sum()}')
+
+        # Colocar a coluna 'mando' depois da coluna 'rodada_id'
+        mando_index = pontuados_completo.columns.get_loc('rodada_id')
+        pontuados_completo.insert(mando_index + 1, 'mando', pontuados_completo.pop('mando'))
+        print(f'Mandos colocados: {pontuados_completo["mando"].notna().sum()}')
+
+        # Para cada scout, criar uma coluna com o nome 'adv_SCOUT_c' e 'adv_SCOUT_f' onde vamos agrupar por scout cedido pelo adversario_id. Se o sufixo for c então o mando tem que ser CASA e se o sufixo for f então o mando tem que ser FORA
+        for scout in self.scouts:
+            pontuados_completo[f'adv_{scout}_c'] = pontuados_completo['adversario_id'].apply(
+                lambda x: 1 if x == scout else 0)
+            pontuados_completo[f'adv_{scout}_f'] = pontuados_completo['adversario_id'].apply(
+                lambda x: 1 if x == scout else 0)
+            # print(f'Colunas {scout}_c e {scout}_f criadas: {pontuados_completo[f"adv_{scout}_c"].notna().sum()}')
+
+        # Definir os valores dos scouts
+        valores_scouts = {
+            'DS': 1.2,
+            'FC': -0.3,
+            'FF': 0.8,
+            'FD': 1.2,
+            'FS': 0.5,
+            'A': 5,
+            'CA': -1,
+            'I': 0.1,
+            'G': 8,
+            'SG': 5,
+            'DE': 1,
+            'GS': -1
+        }
+
+        planilha_associada_mando_casa = pontuados_completo[pontuados_completo['mando'] == 'CASA']
+        planilha_associada_mando_fora = pontuados_completo[pontuados_completo['mando'] == 'FORA']
+
+        # Agora em cada coluna de scout criada, agrupar o somatorio de 'adv_SCOUT_c' e 'adv_SCOUT_f' por 'adversario_id' e 'posicao_id' em cada coluna de scout
+        for scout in self.scouts:
+            pontuados_completo[f'adv_{scout}_c'] = planilha_associada_mando_casa.groupby(
+                ['adversario_id', 'posicao_id', pontuados_completo['mando'] == 'CASA'])[scout].transform('sum')
+            pontuados_completo[f'adv_{scout}_f'] = planilha_associada_mando_fora.groupby(
+                ['adversario_id', 'posicao_id', pontuados_completo['mando'] == 'FORA'])[scout].transform('sum')
+            # Criar planilha de mando_adversario e onde na Mando for CASA será FORA e vice-versa
+            pontuados_completo['mando_adversario'] = pontuados_completo['mando'].apply(
+                lambda x: 'CASA' if x == 'FORA' else 'FORA')
+
+            # print(f'Somatorio de {scout}_c e {scout}_f por adversario_id e posicao_id: {pontuados_completo[f"adv_{scout}_c"].notna().sum()}')
+
+        # Para cada scout, criar uma coluna com o nome 'p_SCOUT_c' e 'p_SCOUT_f' onde vamos agrupar por scout cedido pelo adversario_id
+        for scout in self.scouts:
+            pontuados_completo[f'p_{scout}_c'] = pontuados_completo['adversario_id'].apply(
+                lambda x: 1 if x == scout else 0)
+            pontuados_completo[f'p_{scout}_f'] = pontuados_completo['adversario_id'].apply(
+                lambda x: 1 if x == scout else 0)
+            # print(f'Colunas {scout}_c e {scout}_f criadas: {pontuados_completo[f"p_{scout}_c"].notna().sum()}')
+
+        # Agora em cada coluna de scout criada, agrupar o somatorio de 'p_SCOUT_c' e 'p_SCOUT_f' por 'adversario_id' e 'posicao_id' em cada coluna de scout
+        for scout in self.scouts:
+            pontuados_completo[f'p_{scout}_c'] = planilha_associada_mando_casa.groupby(
+                ['adversario_id', 'posicao_jogador', pontuados_completo['mando'] == 'CASA'])[scout].transform('sum')
+            pontuados_completo[f'p_{scout}_f'] = planilha_associada_mando_fora.groupby(
+                ['adversario_id', 'posicao_jogador', pontuados_completo['mando'] == 'FORA'])[scout].transform('sum')
+            # print(f'Somatorio de {scout}_c e {scout}_f por adversario_id e posicao_id: {pontuados_completo[f"p_{scout}_c"].notna().sum()}')
+
+        # Remover colunas do pontuados completo para formar a cedidos_consolidado
+        colunas_para_manter = [
+                   'foto',
+                   'adversario_id',
+                   'rodada_id',
+                   'posicao_jogador',
+                   'posicao_id',
+                   'mando_adversario',
+                   'adv_DS_c',
+                   'adv_DS_f',
+                   'adv_FC_c',
+                   'adv_FC_f',
+                   'adv_FF_c',
+                   'adv_FF_f',
+                   'adv_FD_c',
+                   'adv_FD_f',
+                   'adv_FS_c',
+                   'adv_FS_f',
+                   'adv_A_c',
+                   'adv_A_f',
+                   'adv_CA_c',
+                   'adv_CA_f',
+                   'adv_I_c',
+                   'adv_I_f',
+                   'adv_SG_c',
+                   'adv_SG_f',
+                   'adv_G_c',
+                   'adv_G_f',
+                   'adv_DE_c',
+                   'adv_DE_f',
+                   'adv_GS_c',
+                   'adv_GS_f',
+                   'adv_V_c',
+                   'adv_V_f',
+                   'adv_CV_c',
+                   'adv_CV_f',
+                   'adv_FT_c',
+                   'adv_FT_f',
+                   'adv_PC_c',
+                   'adv_PC_f',
+                   'adv_PS_c',
+                   'adv_PS_f',
+                   'adv_PP_c',
+                   'adv_PP_f',
+                   'p_DS_c',
+                   'p_DS_f',
+                   'p_FC_c',
+                   'p_FC_f',
+                   'p_FF_c',
+                   'p_FF_f',
+                   'p_FD_c',
+                   'p_FD_f',
+                   'p_FS_c',
+                   'p_FS_f',
+                   'p_A_c',
+                   'p_A_f',
+                   'p_CA_c',
+                   'p_CA_f',
+                   'p_I_c',
+                   'p_I_f',
+                   'p_SG_c',
+                   'p_SG_f',
+                   'p_G_c',
+                   'p_G_f',
+                   'p_DE_c',
+                   'p_DE_f',
+                   'p_GS_c',
+                   'p_GS_f',
+                   'p_V_c',
+                   'p_V_f',
+                   'p_CV_c',
+                   'p_CV_f',
+                   'p_FT_c',
+                   'p_FT_f',
+                   'p_PC_c',
+                   'p_PC_f',
+                   'p_PS_c',
+                   'p_PS_f',
+                   'p_PP_c',
+                   'p_PP_f',
+                   ]
+
+        self.df_cedidos_completo = pontuados_completo[colunas_para_manter]
+
+        # Lista das colunas que serão mantidas como chaves de agrupamento
+        colunas_agrupamento = ['adversario_id', 'posicao_jogador', 'posicao_id', 'mando_adversario']
+
+        # Agrupando por colunas de agrupamento
+        self.df_cedidos_completo = self.df_cedidos_completo.groupby(colunas_agrupamento).first().reset_index()
+        # Remover colunas mando_adversario	rodada_id
+        self.df_cedidos_completo = self.df_cedidos_completo.drop(['mando_adversario', 'rodada_id'], axis=1)
+        # agrupar a self.df_cedidos_completo pelas colunas adversario_id	posicao_jogador	posicao_id e somar as demais
+        self.df_cedidos_completo = self.df_cedidos_completo.groupby(['adversario_id', 'posicao_jogador', 'posicao_id']).sum().reset_index()
+
+        #self.df_cedidos_completo.to_excel(r'C:\Users\renan\OneDrive\Documentos\PyCartola_BETA\cedidos_completo.xlsx', index=False)
+        # Criar df de pontuados_consolidado ===============================================================================
+
+        # Agrupando os dados por atleta_id
+        grupo_atleta = planilha_associada.groupby('atleta_id')
+
+        # Calculando as somas e médias
+        resultado = grupo_atleta.agg({
+            'atleta_id': 'first',
+            #'apelido': 'first',  # Usando a primeira ocorrência de apelido para cada grupo
+            'posicao_id': 'first',  # Usando a primeira ocorrência de posicao_id para cada grupo
+            'posicao_jogador': 'first',  # Usando a primeira ocorrência de posicao_jogador para cada grupo
+            #'clube_id': 'first',  # Usando a primeira ocorrência de clube_id para cada grupo
+            #'rodada_id': 'first',  # Usando a primeira ocorrência de rodada_id para cada grupo
+            'entrou_em_campo': 'sum',
+            'pontuacao': lambda x: x.sum() / x.count(),  # Média da pontuação
+            'DS': 'sum',
+            'FC': 'sum',
+            'FF': 'sum',
+            'FD': 'sum',
+            'FS': 'sum',
+            'A': 'sum',
+            'CA': 'sum',
+            'I': 'sum',
+            'SG': 'sum',
+            'G': 'sum',
+            'DE': 'sum',
+            'GS': 'sum',
+            'V': 'sum',
+            'CV': 'sum',
+            'FT': 'sum',
+            'PC': 'sum',
+            'PS': 'sum',
+            'PP': 'sum',
+        })
+
+        # Dividindo os scouts pela soma de entrou_em_campo
+        scouts_columns = ['DS', 'FC', 'FF', 'FD', 'FS', 'A', 'CA', 'I', 'SG', 'G', 'DE', 'GS', 'V', 'CV', 'FT', 'PC',
+                          'PS', 'PP']
+        resultado[scouts_columns] = resultado[scouts_columns].div(resultado['entrou_em_campo'], axis=0)
+
+        # Renomeando coluna da pontuação média
+        resultado.rename(columns={'pontuacao': 'pontuacao_media'}, inplace=True)
+
+        # Removendo colunas pontuacao_media e entrou_em_campo
+        resultado = resultado.drop(columns=['pontuacao_media', 'entrou_em_campo'])
+
+        self.df_pontuados = resultado
+        #self.df_pontuados.to_excel(r'C:\Users\renan\OneDrive\Documentos\PyCartola_BETA\pontuados_consolidado.xlsx', index=False)
+
+        self.df_pontuados = self.df_pontuados.reset_index(drop=True)
+
+        # Realizando a união das duas planilhas pela coluna comum
+        self.df_mercado = pd.merge(self.df_mercado, self.df_pontuados, on='atleta_id', how='inner')
+
+
+
+        # Unindo as planilhas usando a função merge do pandas
+        self.df_mercado = pd.merge(self.df_mercado, self.df_cedidos_completo, on=['adversario_id', 'posicao_jogador', 'posicao_id'],
+                                  how='left')
+
+        #self.df_mercado = self.df_mercado.drop_duplicates(subset=['adversario_id', 'posicao_jogador', 'posicao_id'])
+        #self.df_mercado.to_excel(r'C:\Users\renan\OneDrive\Documentos\PyCartola_BETA\pontuados_consolidado5.xlsx', index=False)
+
+        # Iniciar o calculo dos scouts: DS	FC	FF	FD	FS	A	CA	I	SG	G	DE	GS
+
+        # ========================================= CALCULAR DS =================================================
+        def calcular_DS_e(row):
+            peso_posicao = 1
+            peso_id = 0.4
+            peso_casa = 1
+            peso_fora = 1
+            if row['mando'] == 'CASA':
+                try:
+                    return round(peso_casa * ((peso_id * (row['DS'] * (row['adv_DS_c'] / (row['rodada_id'] - 1))) +
+                            (peso_posicao * (row['DS'] * (row['p_DS_c'] / (row['rodada_id'] - 1))))) / 2))
+                except:
+                    return 0
+            else:
+                try:
+                    return round(peso_fora * ((peso_id * (row['DS'] * (row['adv_DS_f'] / (row['rodada_id'] - 1))) +
+                            (peso_posicao * (row['DS'] * (row['p_DS_f'] / (row['rodada_id'] - 1))))) / 2))
+                except:
+                    return 0
+        self.df_mercado['DS_e'] = self.df_mercado.apply(calcular_DS_e, axis=1)
+
+        # ========================================= CALCULAR FC =================================================
+        def calcular_FC_e(row):
+            peso_posicao = 1
+            peso_id = 0.4
+            peso_casa = 1
+            peso_fora = 1
+            if row['mando'] == 'CASA':
+                try:
+                    return round(peso_casa * ((peso_id * (row['FC'] * (row['adv_FC_c'] / (row['rodada_id'] - 1))) +
+                            (peso_posicao * (row['FC'] * (row['p_FC_c'] / (row['rodada_id'] - 1))))) / 2))
+                except:
+                    return 0
+            else:
+                try:
+                    return round(peso_fora * ((peso_id * (row['FC'] * (row['adv_FC_f'] / (row['rodada_id'] - 1))) +
+                            (peso_posicao * (row['FC'] * (row['p_FC_f'] / (row['rodada_id'] - 1))))) / 2))
+                except:
+                    return 0
+        self.df_mercado['FC_e'] = self.df_mercado.apply(calcular_FC_e, axis=1)
+
+        # ========================================= CALCULAR FF =================================================
+        def calcular_FF_e(row):
+            peso_posicao = 2
+            peso_id = 1.2
+            peso_casa = 1.2
+            peso_fora = 0.8
+            if row['mando'] == 'CASA':
+                try:
+                    return round(peso_casa * ((peso_id * ((row['FF'] + row['FD']) * (row['adv_FF_c'] / (row['rodada_id'] - 1))) +
+                                  (peso_posicao * ((row['FF'] + row['FD']) * (row['p_FF_c'] / (row['rodada_id'] - 1))))) / 2))
+                except:
+                    return 0
+            else:
+                try:
+                    return round(peso_fora * ((peso_id * ((row['FF'] + row['FD']) * (row['adv_FF_f'] / (row['rodada_id'] - 1))) +
+                                  (peso_posicao * ((row['FF'] + row['FD']) * (row['p_FF_f'] / (row['rodada_id'] - 1))))) / 2))
+                except:
+                    return 0
+        self.df_mercado['FF_e'] = self.df_mercado.apply(calcular_FF_e, axis=1)
+
+        # ========================================= CALCULAR FD =================================================
+        def calcular_FD_e(row):
+            peso_posicao = 1.2
+            peso_id = 0.5
+            peso_casa = 1.2
+            peso_fora = 0.8
+            if row['mando'] == 'CASA':
+                try:
+                    return round(
+                        peso_casa * ((peso_id * ((row['FF'] + row['FD']) * (row['adv_FF_c'] / (row['rodada_id'] - 1))) +
+                                      (peso_posicao * ((row['FF'] + row['FD']) * (
+                                                  row['p_FF_c'] / (row['rodada_id'] - 1))))) / 2))
+                except:
+                    return 0
+            else:
+                try:
+                    return round(
+                        peso_fora * ((peso_id * ((row['FF'] + row['FD']) * (row['adv_FF_f'] / (row['rodada_id'] - 1))) +
+                                      (peso_posicao * ((row['FF'] + row['FD']) * (
+                                                  row['p_FF_f'] / (row['rodada_id'] - 1))))) / 2))
+                except:
+                    return 0
+        self.df_mercado['FD_e'] = self.df_mercado.apply(calcular_FD_e, axis=1)
+
+        # ========================================= CALCULAR FS =================================================
+        def calcular_FS_e(row):
+            peso_posicao = 1.3
+            peso_id = 0.4
+            peso_casa = 1.1
+            peso_fora = 0.9
+            if row['mando'] == 'CASA':
+                try:
+                    return round(peso_casa * ((peso_id * (row['FS'] * (row['adv_FS_c'] / (row['rodada_id'] - 1))) +
+                                               (peso_posicao * (
+                                                       row['FS'] * (row['p_FS_c'] / (row['rodada_id'] - 1))))) / 2))
+                except:
+                    return 0
+            else:
+                try:
+                    return round(peso_fora * ((peso_id * (row['FS'] * (row['adv_FS_f'] / (row['rodada_id'] - 1))) +
+                                               (peso_posicao * (
+                                                       row['FS'] * (row['p_FS_f'] / (row['rodada_id'] - 1))))) / 2))
+                except:
+                    return 0
+        self.df_mercado['FS_e'] = self.df_mercado.apply(calcular_FS_e, axis=1)
+
+        # ========================================= CALCULAR A =================================================
+        def calcular_A_e(row):
+            peso_posicao = 1.3
+            peso_id = 0.4
+            peso_casa = 1.25
+            peso_fora = 0.75
+            # Cria duas colunas para calcular peso do jogo
+            df_filtrado = self.df_mercado[(self.df_mercado['status_id'] == 7) | (self.df_mercado['status_id'] == 2)]
+            soma_por_clube = df_filtrado.groupby('clube_id')['media_num'].sum()
+            self.df_mercado['soma_por_clube'] = self.df_mercado['clube_id'].map(soma_por_clube)
+            soma_por_adversario = df_filtrado.groupby('adversario_id')['media_num'].sum()
+            self.df_mercado['soma_por_adversario'] = self.df_mercado['clube_id'].map(soma_por_adversario)
+            self.df_mercado['peso_jogo'] = (self.df_mercado['soma_por_clube'] / self.df_mercado['soma_por_adversario'])
+
+            # Remover colunas soma_por_clube e soma_por_adversario
+            self.df_mercado = self.df_mercado.drop(['soma_por_clube', 'soma_por_adversario'], axis=1)
+
+            if row['mando'] == 'CASA':
+                try:
+                    return (
+                        row['A'] * ((row['adv_A_c'] * peso_id) + (row['p_A_c'] * peso_posicao)))
+                except:
+                    return 0
+
+            else:
+                try:
+                    return (
+                        row['A'] * ((row['adv_A_f'] * peso_id) + (row['p_A_f'] * peso_posicao))
+                    )
+                except:
+                    return 0
+        self.df_mercado['A_e'] = self.df_mercado.apply(calcular_A_e, axis=1)
+        self.df_mercado['A_e'] = round(self.df_mercado['A_e'] * self.df_mercado['peso_jogo'])
+        # Trazendo a coluna peso_jogo para um índice depois da coluna posicao_jogador
+        mando_index = self.df_mercado.columns.get_loc('posicao_jogador')
+        self.df_mercado.insert(mando_index + 1, 'peso_jogo', self.df_mercado.pop('peso_jogo'))
+
+        # ========================================= CALCULAR CA =================================================
+        def calcular_CA_e(row):
+            peso_posicao = 1
+            peso_id = 1
+            peso_casa = 0.8
+            peso_fora = 1.2
+            fc_ca = 6
+            if row['mando'] == 'CASA':
+                try:
+                    return round((peso_casa * ((peso_id * (row['CA'] * (row['adv_CA_c'] / (row['rodada_id'] - 1))) + (peso_posicao * (row['CA'] * (row['p_CA_c'] / (row['rodada_id'] - 1))))) / 2)) + (row['FC_e'] / fc_ca))
+                except:
+                    return 0
+            else:
+                try:
+                    return round((peso_fora * ((peso_id * (row['CA'] * (row['adv_CA_f'] / (row['rodada_id'] - 1))) +(peso_posicao * (row['CA'] * (row['p_CA_f'] / (row['rodada_id'] - 1))))) / 2)) + (row['FC_e'] / fc_ca))
+                except:
+                    return 0
+        self.df_mercado['CA_e'] = self.df_mercado.apply(calcular_CA_e, axis=1)
+
+        # ========================================= CALCULAR I =================================================
+        def calcular_I_e(row):
+            peso_posicao = 1
+            peso_id = 0.4
+            peso_casa = 2
+            peso_fora = 2
+            if row['mando'] == 'CASA':
+                try:
+                    return round(peso_casa * ((peso_id * (row['I'] * (row['adv_I_c'] / (row['rodada_id'] - 1))) +
+                                               (peso_posicao * (
+                                                           row['I'] * (row['p_I_c'] / (row['rodada_id'] - 1))))) / 2))
+                except:
+                    return 0
+            else:
+                try:
+                    return round(peso_fora * ((peso_id * (row['I'] * (row['adv_I_f'] / (row['rodada_id'] - 1))) +
+                                               (peso_posicao * (
+                                                           row['I'] * (row['p_I_f'] / (row['rodada_id'] - 1))))) / 2))
+                except:
+                    return 0
+        self.df_mercado['I_e'] = self.df_mercado.apply(calcular_I_e, axis=1)
+
+        # ========================================= CALCULAR G =================================================
+        def calcular_G_e(row):
+            peso_posicao = 1.7
+            peso_id = .8
+            peso_casa = 1
+            peso_fora = .9
+            fd_g = 7
+            ff_g = 13
+            if row['mando'] == 'CASA':
+                try:
+                    return  round(peso_casa *
+                             row['peso_jogo'] *
+                             (((peso_id *(row['G'] * (row['adv_G_c'] / (row['rodada_id'] - 1))) +
+                                (peso_posicao * (row['G'] * (row['adv_G_c'] / (row['rodada_id'] - 1)))))/ 2) +
+                              (((row['FD_e'] + (row['FT'] / row['jogos_num']))/ fd_g) + (row['FF_e'] / ff_g))))
+                except:
+                    return 0
+            else:
+                try:
+                    return round(peso_fora *
+                             row['peso_jogo'] *
+                             (((peso_id *(row['G'] * (row['adv_G_f'] / (row['rodada_id'] - 1))) +
+                                (peso_posicao * (row['G'] * (row['adv_G_f'] / (row['rodada_id'] - 1)))))/ 2) +
+                              (((row['FD_e'] + (row['FT'] / row['jogos_num']))/ fd_g) + (row['FF_e'] / ff_g))))
+
+                except:
+                    return 0
+        self.df_mercado['G_e'] = self.df_mercado.apply(calcular_G_e, axis=1)
+
+        # ========================================= CALCULAR SG =================================================
+        def calcular_SG_e(adversario_id, clube_id):
+            gols_adversario = self.df_mercado[(self.df_mercado['clube_id'] == adversario_id) & (self.df_mercado['clube_id'] != clube_id) & (self.df_mercado['status_id'] == 7)]['G_e'].sum()
+            if gols_adversario > 0:
+                return 0
+            else:
+                return 1
+        # Criar uma nova coluna SG_e com valor padrão 0 para todos os jogadores
+        self.df_mercado['SG_e'] = 0
+        # Filtrar as linhas onde posicao_id é 1, 2 ou 3
+        df_filtrado = self.df_mercado[self.df_mercado['posicao_id'].isin([1, 2, 3])]
+        # Aplicar a função para ajustar SG_e apenas para os jogadores com posicao_id 1, 2 ou 3
+        self.df_mercado.loc[df_filtrado.index, 'SG_e'] = df_filtrado.apply(
+            lambda row: calcular_SG_e(row['adversario_id'], row['clube_id']), axis=1)
+
+        # ========================================= CALCULAR DE =================================================
+        def calcular_DE_e(adversario_id, clube_id):
+            defesas_adversario = self.df_mercado[(self.df_mercado['clube_id'] == adversario_id) & (self.df_mercado['clube_id'] != clube_id) & (self.df_mercado['status_id'] == 7)]['FD_e'].sum()
+            return defesas_adversario
+        # Criar uma nova coluna DE_e com valor padrão 0 para todos os jogadores
+        self.df_mercado['DE_e'] = 0
+        # Filtrar as linhas onde posicao_id é 1 (goleiros)
+        df_goleiros = self.df_mercado[self.df_mercado['posicao_id'] == 1]
+        self.df_mercado.loc[df_goleiros.index, 'DE_e'] = df_goleiros.apply(
+            lambda row: calcular_DE_e(row['adversario_id'], row['clube_id']), axis=1)
+
+        # ========================================= CALCULAR GS =================================================
+        def calcular_GS_e(adversario_id, clube_id):
+            gols_sofridos = self.df_mercado[
+                (self.df_mercado['clube_id'] == adversario_id) & (self.df_mercado['clube_id'] != clube_id) & (
+                            self.df_mercado['status_id'] == 7)]['G_e'].sum()
+            return gols_sofridos
+        # Criar uma nova coluna DE_e com valor padrão 0 para todos os jogadores
+        self.df_mercado['GS_e'] = 0
+        # Filtrar as linhas onde posicao_id é 1 (goleiros)
+        df_goleiros = self.df_mercado[self.df_mercado['posicao_id'] == 1]
+        self.df_mercado.loc[df_goleiros.index, 'GS_e'] = df_goleiros.apply(
+            lambda row: calcular_GS_e(row['adversario_id'], row['clube_id']), axis=1)
+
+        # ============================== ADICIONANDO PONTUAÇÃO DOS JOGADORES =====================================
+        # Criar as colunas de pontos
+        for scout, valor in valores_scouts.items():
+            coluna_pontos = f'{scout}_pt'
+            self.df_mercado[coluna_pontos] = self.df_mercado[scout + '_e'] * valor
+
+        # Adicionar coluna com o somatório dos scouts
+        colunas_scouts = [f'{scout}_pt' for scout in valores_scouts.keys()]
+
+        resposta = input('Deseja considerar apenas scout basico (S/N)? ')
+        if resposta.upper() == 'S':
+            self.df_mercado['A_pt'] = 0
+            self.df_mercado['G_pt'] = 0
+
+        resposta = input('Deseja considerar apenas os jogadores prováveis no cartola (S/N)? ')
+        if resposta.upper() == 'S':
+            self.df_mercado = self.df_mercado[self.df_mercado['status_id'] == 7]
+
+        self.df_mercado['pontos'] = self.df_mercado[colunas_scouts].sum(axis=1)
+
+        url = "https://api.cartola.globo.com/atletas/mercado"
+        response = requests.get(url)
+
+        # Verificar se a requisição foi bem sucedida
+        if response.status_code == 200:
+            data = response.json()
+
+            # Criar um dicionário com os dados dos clubes
+            clubes_dict = {}
+            for clube in data['clubes']:
+                clube_id = str(clube)
+                clubes_dict[clube_id] = {
+                    "nome": data['clubes'][clube]['nome'],
+                    "abreviacao": data['clubes'][clube]['abreviacao'],
+                    "id": data['clubes'][clube]['id']
+                }
+
+            # Substituir os valores na coluna clube_id e adversario_id pelo nome do clube
+            self.df_mercado['clube_id'] = self.df_mercado['clube_id'].astype(str)
+            self.df_mercado['clube_id'] = self.df_mercado['clube_id'].map(lambda x: clubes_dict[x]['nome'] if x in clubes_dict else x)
+
+            self.df_mercado['adversario_id'] = self.df_mercado['adversario_id'].astype(str)
+            self.df_mercado['adversario_id'] = self.df_mercado['adversario_id'].map(lambda x: clubes_dict[x]['nome'] if x in clubes_dict else x)
+
+        # Dicionário de correspondência entre status_id e nome
+        correspondencia_status = {
+            2: {"nome": "Dúvida", "id": 2},
+            3: {"nome": "Suspenso", "id": 3},
+            5: {"nome": "Contundido", "id": 5},
+            6: {"nome": "Nulo", "id": 6},
+            7: {"nome": "Provável", "id": 7}
+        }
+
+        # Função para substituir o status_id pelo nome correspondente
+        def obter_nome_por_id(status_id):
+            return correspondencia_status[status_id]['nome']
+
+        # Substituir os valores na coluna 'status_id' pelos nomes correspondentes
+        self.df_mercado['status_id'] = self.df_mercado['status_id'].apply(obter_nome_por_id)
+
+        self.df_mercado.to_excel(r'C:\Users\renan\OneDrive\Documentos\PyCartola_BETA\mercado.xlsx', index=False)
+        print("Mercado concluído")
+
+        dividir = True
+        while True:
+            df_mostrar = self.df_mercado
+
+            # Colunas com valores inteiros que precisam ser divididos pelo numero de rodadas jogadas
+            lista_inteiros = ['p_DS_c', 'p_DS_f', 'p_FC_c', 'p_FC_f', 'p_FF_c', 'p_FF_f', 'p_FD_c', 'p_FD_f',
+                     'p_FS_c', 'p_FS_f', 'p_A_c', 'p_A_f', 'p_CA_c', 'p_CA_f', 'p_I_c', 'p_I_f',
+                     'p_SG_c', 'p_SG_f', 'p_G_c', 'p_G_f', 'p_DE_c', 'p_DE_f', 'p_GS_c', 'p_GS_f',
+                     'p_V_c', 'p_V_f', 'p_CV_c', 'p_CV_f', 'p_FT_c', 'p_FT_f', 'p_PC_c', 'p_PC_f',
+                     'p_PS_c', 'p_PS_f', 'p_PP_c', 'p_PP_f']
+
+            # Dividir valores das colunas lista_inteiros pela rodada_atual
+
+            # Primeiro, obtenha o número da rodada atual
+            rodada_atual = df_mostrar['rodada_id'].iloc[0] - 1
+
+            # Em seguida, você pode usar esse valor para atualizar a coluna desejada
+            print(f'\nRodada atual: {df_mostrar["rodada_id"] - 1}\n')
+            if dividir:
+                for coluna in lista_inteiros:
+                    df_mostrar[coluna] = df_mostrar[coluna] / rodada_atual
+                dividir = False
+
+            posicao = input('Deseja listar qual posição para conferir?\n1 - Goleiros\n2 - Laterais\n3 - Zagueiros\n4 - Meias\n5 - Atacantes\n6 - Técnicos\n')
+            # Filtrar o dataframe para a 'posicao_id' atual se for numero
+            if posicao.isnumeric() and int(posicao) <= 6:
+                posicao = int(posicao)
+                df_mostrar = df_mostrar[df_mostrar['posicao_id'] == posicao]
+                # Classificar pela coluna Pontos
+                df_mostrar = df_mostrar.sort_values(by='pontos', ascending=False)
+                posicoes = 'Goleiros', 'Laterais', 'Zagueiros', 'Meias', 'Atacantes', 'Técnicos'
+
+                # Agora fazer isso via map
+                posicoes_para_salvar = list(map(lambda x: posicoes[x-1], [posicao]))[0]
+            else:
+                print('Posição inválida')
+                continue
+
+            # Filtrar pela quantidade de jogadores a mostrar
+            quantidade_jogadores = input('Deseja listar quantos jogadores?\n')
+            if quantidade_jogadores.isnumeric():
+                df_mostrar = df_mostrar.head(int(quantidade_jogadores))
+            else:
+                print('Quantidade inválida')
+                continue
+
+
+            # Remover colunas
+            lista = ['atleta_id', 'nome', 'variacao_num', 'rodada_id', 'posicao_id',
+                     "adv_DS_c", "adv_DS_f", "adv_FC_c", "adv_FC_f", "adv_FF_c", "adv_FF_f",
+                     "adv_FD_c", "adv_FD_f", "adv_FS_c", "adv_FS_f", "adv_A_c", "adv_A_f",
+                     "adv_CA_c", "adv_CA_f", "adv_I_c", "adv_I_f", "adv_SG_c", "adv_SG_f",
+                     "adv_G_c", "adv_G_f", "adv_DE_c", "adv_DE_f", "adv_GS_c", "adv_GS_f",
+                     "adv_V_c", "adv_V_f", "adv_CV_c", "adv_CV_f", "adv_FT_c", "adv_FT_f",
+                     "adv_PC_c", "adv_PC_f", "adv_PS_c", "adv_PS_f", "adv_PP_c", "adv_PP_f"]
+
+            # renomear e dropar colunas desnecessarias. atuais(DS	FC	FF	FD	FS	A	CA	I	SG	G	DE	GS	V	CV	FT	PC	PS	PP		p_DS_c	p_DS_f	p_FC_c	p_FC_f	p_FF_c	p_FF_f	p_FD_c	p_FD_f	p_FS_c	p_FS_f	p_A_c	p_A_f	p_CA_c	p_CA_f	p_I_c	p_I_f	p_SG_c	p_SG_f	p_G_c	p_G_f	p_DE_c	p_DE_f	p_GS_c	p_GS_f	p_V_c	p_V_f	p_CV_c	p_CV_f	p_FT_c	p_FT_f	p_PC_c	p_PC_f	p_PS_c	p_PS_f	p_PP_c	p_PP_f	DS_e	FC_e	FF_e	FD_e	FS_e	A_e	CA_e	I_e	G_e	SG_e	DE_e	GS_e	DS_pt	FC_pt	FF_pt	FD_pt	FS_pt	A_pt	CA_pt	I_pt	G_pt	SG_pt	DE_pt	GS_pt	pontos)
+            df_mostrar.drop(columns=lista, inplace=True)
+
+            # Ordenar os jogadores pela coluna 'pontos' e pegar os top 10
+            top_jogadores_posicao_atual = df_mostrar.sort_values(by='pontos', ascending=False)
+            print(top_jogadores_posicao_atual)
+            top_jogadores_posicao_atual.to_excel(rf'C:\Users\renan\OneDrive\Documentos\PyCartola_BETA\{posicoes_para_salvar}.xlsx', index=False)
+
+            # Pressione Enter para reiniciar
+            print('Listagem gerada...')
+            input('\nPressione Enter para reiniciar')
+if __name__ == "__main__":
+    app = PyCartola()
+    app.mainloop()
+
+
